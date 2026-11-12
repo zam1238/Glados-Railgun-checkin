@@ -1012,6 +1012,9 @@ class Config:
 
     ENV_PUSH_KEY = "PUSHDEER_SENDKEY"
     ENV_SERVERCHAN_KEY = "SERVERCHAN_SENDKEY"
+    ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN"
+    ENV_TG_CHAT_ID = "TG_CHAT_ID"
+    ENV_TG_API_URL = "TG_API_URL"
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
@@ -1023,6 +1026,9 @@ class Config:
         self.env = env if env is not None else os.environ
         self.push_key = ""
         self.serverchan_key = ""
+        self.tg_bot_token = ""
+        self.tg_chat_id = ""
+        self.tg_api_url = ""
         self.accounts = Accounts()
         self.exchange_plan = self.DEFAULT_EXCHANGE_PLAN
         self.verbose = self.DEFAULT_VERBOSE
@@ -1041,6 +1047,7 @@ class Config:
 
     def _load(self) -> None:
         self._load_push_keys()
+        self._load_telegram()
         # verbose 必须先加载：Accounts.parse 需要它来决定新建账号的 verbose 初值
         self._load_verbose()
         self._load_accounts()
@@ -1050,6 +1057,7 @@ class Config:
         for account in self.accounts:
             logger.info(f"{LogEmoji.INFO} {LogEmoji.COOKIE}[{account.label}] {LogEmoji.DOMAIN}[{account.origin or '待探测'}] UA={'自定义' if account.user_agent else '默认'}")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_PUSH_KEY} {'已设置' if self.push_key else '未设置'}，" f"{self.ENV_SERVERCHAN_KEY} {'已设置' if self.serverchan_key else '未设置'}。")
+        logger.info(f"{LogEmoji.INFO} 当前 Telegram {'已设置' if self.tg_bot_token and self.tg_chat_id else '未设置'}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_EXCHANGE_PLAN}: {self.exchange_plan}。")
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
 
@@ -1062,6 +1070,13 @@ class Config:
             setattr(self, key, value)
             if not value:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{env_name}' 未设置。")
+
+    def _load_telegram(self) -> None:
+        self.tg_bot_token = self._get(self.ENV_TG_BOT_TOKEN)
+        self.tg_chat_id = self._get(self.ENV_TG_CHAT_ID)
+        self.tg_api_url = self._get(self.ENV_TG_API_URL) or "https://api.telegram.org"
+        if not self.tg_bot_token or not self.tg_chat_id:
+            logger.warning(f"{LogEmoji.WARNING} Telegram 未配置（需要 TG_BOT_TOKEN 与 TG_CHAT_ID，TG_API_URL 不填默认用 https://api.telegram.org）。")
 
     def _load_accounts(self) -> None:
         raw = self._get(self.ENV_COOKIES)
@@ -1217,6 +1232,40 @@ class ServerChanBackend(PushBackend):
             return False
 
 
+class TelegramBackend(PushBackend):
+    """Telegram 后端（Bot API）"""
+
+    name = "Telegram"
+
+    def __init__(self, bot_token: str, chat_id: str, api_url: str = "https://api.telegram.org"):
+        self.bot_token = bot_token
+        self.chat_id = chat_id
+        self.api_url = (api_url or "https://api.telegram.org").rstrip("/")
+
+    def send(self, report: Report) -> bool:
+        try:
+            import requests
+        except ImportError:
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: 未安装 requests。")
+            return False
+
+        try:
+            text = f"{report.title}\n{self._render(report)}"
+            resp = requests.post(
+                f"{self.api_url}/bot{self.bot_token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": text},
+                timeout=30,
+            )
+            data = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            if resp.status_code == 200 and isinstance(data, dict) and data.get("ok"):
+                return True
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: HTTP {resp.status_code} {resp.text[:200]}")
+            return False
+        except Exception as e:  # noqa: BLE001 - 推送失败不应影响主流程
+            logger.error(f"{LogEmoji.ERROR} [{self.name}] 推送失败: {e}")
+            return False
+
+
 class PushService:
     """聚合多个推送后端，向全部已配置的后端发送（都发）"""
 
@@ -1228,6 +1277,8 @@ class PushService:
             self.backends.append(PushDeerBackend(config.push_key))
         if config.serverchan_key:
             self.backends.append(ServerChanBackend(config.serverchan_key))
+        if config.tg_bot_token and config.tg_chat_id:
+            self.backends.append(TelegramBackend(config.tg_bot_token, config.tg_chat_id, config.tg_api_url))
 
     def send(self, report: Report) -> bool:
         """向所有已配置后端发送，任一成功即视为成功"""
